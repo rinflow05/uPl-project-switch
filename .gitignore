@@ -1,0 +1,18 @@
+# 编译产物
+*.exe
+*.o
+*.obj
+*.pdb
+
+# Visual Studio Code
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  you could uncomment the following to ignore the entire vscode folder
+.vscode/
+
+# 本工具生成的 v3 转换产物
+*_v3.uprj
+
+# 参考文件（外部工程源码，不计入版本库）
+参考项目/

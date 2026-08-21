@@ -1,10 +1,11 @@
 /**
- * uplr_v2to3.c — ustxPlayer 工程文件 v2 → v3 转换工具
+ * uPl-project-switch.c — ustxPlayer 的工程格式转换工具（uPl 项目的一部分）
  *
- * 拖放 .uplr 文件到此程序上，自动检测版本并转换。
- * v2 (ustx_content YAML 原文) → v3 (ustx_data 解析后结构化数据)
+ * 拖放 .uplr 工程文件到此程序上，自动识别并转换为对应程序可读取的工程文件。
+ * uPl 是 ustxPlayer 与 ustPlayer 两个程序共同的项目名缩写，
+ * 本工具在两者之间转换工程格式。
  *
- * 编译: gcc -Os -s -static -o uplr_v2to3.exe uplr_v2to3.c
+ * 编译: gcc -Os -s -static -o uPl-project-switch.exe uPl-project-switch.c
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <wchar.h>
 #endif
 
 /* ===================== 动态缓冲区 ===================== */
@@ -65,10 +67,39 @@ static void buf_json_str(Buf *b, const char *s) {
     buf_char(b, '"');
 }
 
-/* ===================== 文件 I/O ===================== */
+/* ===================== 文件 I/O（统一 UTF-8 路径） ===================== */
+
+#ifdef _WIN32
+/* UTF-8 路径 转 宽字符（供 _wfopen 使用，避免 ANSI 代码页与 UTF-8 冲突导致中文乱码/打不开） */
+static const wchar_t *utf8_to_wide(const char *u8, wchar_t *buf, int buflen) {
+    if (MultiByteToWideChar(CP_UTF8, 0, u8, -1, buf, buflen) <= 0) return NULL;
+    return buf;
+}
+/* 宽字符 转 UTF-8（用于打印和程序内部统一用 UTF-8） */
+static char *wide_to_utf8(const wchar_t *w, char *buf, int buflen) {
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, buflen, NULL, NULL) <= 0) return NULL;
+    return buf;
+}
+static FILE *pfopen(const char *path, const char *mode) {
+    wchar_t wpath[4096], wmode[16];
+    if (!utf8_to_wide(path, wpath, (int)(sizeof(wpath) / sizeof(wchar_t)))) return NULL;
+    if (!utf8_to_wide(mode, wmode, (int)(sizeof(wmode) / sizeof(wchar_t)))) return NULL;
+    return _wfopen(wpath, wmode);
+}
+#else
+static FILE *pfopen(const char *path, const char *mode) { return fopen(path, mode); }
+#endif
+
+/* 文件是否存在（UTF-8 路径） */
+static int file_exists(const char *path) {
+    FILE *f = pfopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
 
 static char *read_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = pfopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -83,7 +114,7 @@ static char *read_file(const char *path, size_t *out_len) {
 }
 
 static int write_file(const char *path, const char *data, size_t len) {
-    FILE *f = fopen(path, "wb");
+    FILE *f = pfopen(path, "wb");
     if (!f) return -1;
     size_t n = fwrite(data, 1, len, f);
     fclose(f);
@@ -159,12 +190,27 @@ static char *extract_json_string(const char *json, const char *key) {
                     unsigned int cp = 0;
                     sscanf(p + 2, "%4x", &cp);
                     p += 4;
+                    /* 高低代理配对（\uDXXX\uDYYY）还原成单个码点，避免 emoji 等乱码 */
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        p + 6 < e && p[1] == '\\' && p[2] == 'u') {
+                        unsigned int lo = 0;
+                        sscanf(p + 3, "%4x", &lo);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            p += 6;
+                        }
+                    }
                     if (cp < 0x80) out[j++] = (char)cp;
                     else if (cp < 0x800) {
                         out[j++] = (char)(0xC0 | (cp >> 6));
                         out[j++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
+                    } else if (cp < 0x10000) {
                         out[j++] = (char)(0xE0 | (cp >> 12));
+                        out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[j++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[j++] = (char)(0xF0 | (cp >> 18));
+                        out[j++] = (char)(0x80 | ((cp >> 12) & 0x3F));
                         out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                         out[j++] = (char)(0x80 | (cp & 0x3F));
                     }
@@ -507,10 +553,13 @@ static void parse_ustx(const char *yaml, UstxData *d) {
     li = find_root_key(lines, total_lines, "tracks");
     if (li >= 0) {
         int next_root = find_next_root(lines, total_lines, li);
-        int track_idx = 0;
+        int track_idx = 0;        /* 已见到的轨道数量 */
+        int cur_track = -1;       /* 当前轨道下标（0 起，与 voice_parts 的 track_no 对齐） */
+        int *name_owner = NULL;   /* names[i] 归属的轨道下标 */
         char **names = NULL;
         int name_count = 0;
-        /* 先收集 track_name */
+        /* 先收集 track_name，并记录其归属的轨道下标，
+           避免部分轨道缺名时把名字错位塞进别的轨道（参照 ustxreader 按下标取名） */
         for (int i = li + 1; i < next_root; i++) {
             if (is_blank_or_comment(lines[i])) continue;
             int ind = indent_level(lines[i]);
@@ -518,38 +567,41 @@ static void parse_ustx(const char *yaml, UstxData *d) {
                                    嵌套列表项（dash 在缩进>0，如 singer 子模型、phonemizer 参数）
                                    不是独立轨道，必须排除，否则会被误计。 */
             if (ind == 0 && lines[i][ind] == '-') {
+                cur_track = track_idx;
                 track_idx++;
-                /* 同行可能有 track_name */
-                const char *content = skip_indent_item(lines[i]);
-                /* 检查是否有 track_name 在同一行 */
-            } else if (ind > 0) {
+            } else if (ind > 0 && cur_track >= 0) {
                 char k[128]; const char *v; int vl;
                 if (parse_yaml_kv(lines[i], k, sizeof(k), &v, &vl)) {
                     if (strcmp(k, "track_name") == 0 || strcmp(k, "name") == 0) {
                         char name[128];
                         extract_yaml_quoted(v, vl, name, sizeof(name));
-                        /* 存储到临时数组 */
                         name_count++;
                         names = (char**)realloc(names, name_count * sizeof(char*));
+                        name_owner = (int*)realloc(name_owner, name_count * sizeof(int));
+                        name_owner[name_count - 1] = cur_track;
                         names[name_count - 1] = strdup(name);
                     }
                 }
             }
         }
         d->tracks = track_idx > 0 ? track_idx : 1;
-        /* track_names 暂存，后面用于 tracks_info */
         d->tracks_info = (TrackInfo*)calloc(d->tracks, sizeof(TrackInfo));
         for (int i = 0; i < d->tracks; i++) {
             d->tracks_info[i].track_no = i;
-            if (i < name_count && names) {
-                strncpy(d->tracks_info[i].track_name, names[i], 127);
-                free(names[i]);
-            } else {
-                snprintf(d->tracks_info[i].track_name, 128, "轨道 %d", i + 1);
+            int found = 0;
+            for (int ni = 0; ni < name_count; ni++) {
+                if (name_owner[ni] == i) {
+                    strncpy(d->tracks_info[i].track_name, names[ni], 127);
+                    d->tracks_info[i].track_name[127] = '\0';
+                    found = 1;
+                    break;
+                }
             }
+            if (!found) snprintf(d->tracks_info[i].track_name, 128, "轨道 %d", i + 1);
             d->tracks_info[i].note_count = 0;
         }
-        free(names);
+        for (int ni = 0; ni < name_count; ni++) free(names[ni]);
+        free(names); free(name_owner);
     } else d->tracks = 1;
 
     /* 4. wave_parts count + wave track flags（音频轨） */
@@ -864,7 +916,7 @@ static void parse_ustx(const char *yaml, UstxData *d) {
     free(lines);
 }
 
-/* ===================== settings v3 重写 ===================== */
+/* ===================== settings 规范化重写 ===================== */
 
 /* 跳过 p 处的一个 JSON 值，返回其后已闭合的指针（p 指向值起点：'"'/'{ ' '['/标量） */
 static const char *json_skip_value(const char *p) {
@@ -966,8 +1018,8 @@ static void buf_emit_style_compact(Buf *out, SEntry *style_obj, int style_n) {
     buf_char(out, '}');
 }
 
-/* 重新生成 v3 settings 对象（含 CRLF），写入 out。
- * raw 是 v2 的 settings JSON（含 { }）。d 提供轨道信息以重映射 note_styles。 */
+/* 重新生成规范化的 settings 对象（含 CRLF），写入 out。
+ * raw 是原始 settings JSON（含 { }）。d 提供轨道信息以重映射 note_styles。 */
 static void emit_settings(Buf *out, const char *raw, UstxData *d) {
     if (!raw || !*raw) {
         /* 空设置：仅补 selected_track_no */
@@ -977,9 +1029,11 @@ static void emit_settings(Buf *out, const char *raw, UstxData *d) {
     SEntry *entries = NULL;
     int n = split_object_entries(raw, &entries);
 
-    /* 原文 note_styles（键=全局行号, 值=样式） */
-    int orig_style[8192];
-    for (int i = 0; i < 8192; i++) orig_style[i] = 0;
+    /* 原文 note_styles（键=全局行号, 值=样式）。
+       note_styles 的键是全局音符行号，取值区间为 [0, note_count)，据此动态分配，
+       避免音符数超过 8192 的大工程发生栈溢出。 */
+    int style_cap = d->note_count > 0 ? d->note_count : 1;
+    int *orig_style = (int*)calloc((size_t)style_cap, sizeof(int));
     for (int i = 0; i < n; i++) {
         if (strcmp(entries[i].key, "note_styles") == 0 && entries[i].type == 2) {
             SEntry *ns = NULL;
@@ -989,18 +1043,19 @@ static void emit_settings(Buf *out, const char *raw, UstxData *d) {
                 char v[32]; int vl = (int)(ns[j].vend - ns[j].vstart);
                 if (vl >= 31) vl = 31;
                 memcpy(v, ns[j].vstart, vl); v[vl] = '\0';
-                if (k >= 0 && k < 8192) orig_style[k] = atoi(v);
+                if (k >= 0 && k < style_cap) orig_style[k] = atoi(v);
             }
             free(ns);
             break;
         }
     }
 
-    /* 选中轨（转换按 v3 默认第 0 轨处理）；收集该轨音符的全局行号 */
+    /* 选中轨（目标格式默认按第 0 轨处理）；收集该轨音符的全局行号 */
     int sel = 0;
-    int sel_rows[8192]; int sel_n = 0;
+    int *sel_rows = (int*)malloc((size_t)style_cap * sizeof(int));
+    int sel_n = 0;
     for (int i = 0; i < d->note_count; i++) {
-        if (d->notes[i].track_no == sel) sel_rows[sel_n++] = i;
+        if (d->notes[i].track_no == sel && sel_n < style_cap) sel_rows[sel_n++] = i;
     }
     /* selected_track_no 非 0 时：构建过滤与 note_styles 均按选中轨 */
     for (int i = 0; i < n; i++) {
@@ -1014,7 +1069,7 @@ static void emit_settings(Buf *out, const char *raw, UstxData *d) {
                 sel = st;
                 sel_n = 0;
                 for (int g = 0; g < d->note_count; g++)
-                    if (d->notes[g].track_no == sel) sel_rows[sel_n++] = g;
+                    if (d->notes[g].track_no == sel && sel_n < style_cap) sel_rows[sel_n++] = g;
             }
         }
     }
@@ -1085,9 +1140,11 @@ static void emit_settings(Buf *out, const char *raw, UstxData *d) {
     buf_str(out, "  }");
 
     free(entries);
+    free(orig_style);
+    free(sel_rows);
 }
 
-/* ===================== v3 JSON 生成 ===================== */
+/* ===================== 目标格式 JSON 生成 ===================== */
 
 static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
     buf_str(out, "{\r\n");
@@ -1200,10 +1257,24 @@ static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
 static char *make_output_path(const char *input) {
     const char *dot = strrchr(input, '.');
     size_t base_len = dot ? (size_t)(dot - input) : strlen(input);
-    char *out = (char*)malloc(base_len + 9);
+    size_t cap = base_len + 32;
+    char *out = (char*)malloc(cap);
     memcpy(out, input, base_len);
-    memcpy(out + base_len, "_v3.uprj", 8);
-    out[base_len + 8] = '\0';
+    memcpy(out + base_len, "_v3", 3); /* 前段：名字_v3 */
+    out[base_len + 3] = '\0';
+    /* 目标已存在则自动加序号：名字_v3.uprj → 名字_v3_1.uprj → 名字_v3_2.uprj ... */
+    for (int k = 0; ; k++) {
+        char *ap = out + base_len + 3;
+        size_t rem = cap - (base_len + 3);
+        int n = (k == 0) ? snprintf(ap, rem, ".uprj")
+                         : snprintf(ap, rem, "_%d.uprj", k);
+        if (n < 0 || (size_t)n >= rem) {
+            cap *= 2;
+            out = (char*)realloc(out, cap);
+            continue;
+        }
+        if (!file_exists(out)) break;
+    }
     return out;
 }
 
@@ -1217,21 +1288,39 @@ static void pause_exit(int code) {
     exit(code);
 }
 
+static void print_usage(void) {
+    printf("ustxPlayer 的工程格式转换工具（uPl：ustxPlayer 与 ustPlayer 共同项目）\n\n");
+    printf("用法：拖放 .uplr 文件到此程序上即可自动转换\n\n");
+    printf("在 ustxPlayer 与 ustPlayer 两个程序之间转换工程格式\n");
+}
+
 int main(int argc, char *argv[]) {
+    const char *input_path = NULL;
 #ifdef _WIN32
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
-#endif
-
-    if (argc < 2) {
-        printf("ustxPlayer 工程文件 v2 → v3 转换工具\n\n");
-        printf("用法：拖放 .uplr 文件到此程序上即可自动转换\n\n");
-        printf("转换内容：\n");
-        printf("  v2 (ustx_content YAML 原文) → v3 (ustx_data 解析后数据)\n");
+    /* 用宽字符命令行拿取原始路径并转成 UTF-8，
+       避免中文路径在 ANSI(GBK)/UTF-8 之间转换而乱码 */
+    int ac = 0;
+    LPWSTR *wav = CommandLineToArgvW(GetCommandLineW(), &ac);
+    if (ac < 2) {
+        print_usage();
+        if (wav) LocalFree(wav);
         pause_exit(0);
     }
+    static char u8path[4096];
+    if (!wide_to_utf8(wav[1], u8path, (int)sizeof u8path)) {
+        printf("错误：无法解析文件路径\n");
+        if (wav) LocalFree(wav);
+        pause_exit(1);
+    }
+    if (wav) LocalFree(wav);
+    input_path = u8path;
+#else
+    if (argc < 2) { print_usage(); return 0; }
+    input_path = argv[1];
+#endif
 
-    const char *input_path = argv[1];
     size_t file_len;
     char *json = read_file(input_path, &file_len);
     if (!json) {
@@ -1266,13 +1355,13 @@ int main(int argc, char *argv[]) {
     }
 
     if (version == 3) {
-        printf("文件已经是 v3 格式，无需转换\n");
+        printf("文件已是目标格式，无需转换\n");
         free(json);
         pause_exit(0);
     }
 
     if (version != 2) {
-        printf("错误：不支持的版本 %d，仅支持 v2 → v3 转换\n", version);
+        printf("错误：不支持的版本 %d\n", version);
         free(json);
         pause_exit(1);
     }
@@ -1285,7 +1374,7 @@ int main(int argc, char *argv[]) {
         pause_exit(1);
     }
 
-    /* 提取 settings（原始 v2 settings，交给 emit_settings 重写为 v3 规范） */
+    /* 提取 settings（原始内容，交给 emit_settings 重写为规范结构） */
     char *settings_raw = extract_settings(json);
 
     /* 解析 USTX YAML */
@@ -1301,7 +1390,7 @@ int main(int argc, char *argv[]) {
         printf("警告：未解析到任何音符\n");
     }
 
-    /* 生成 v3 JSON */
+    /* 生成目标格式 JSON */
     Buf out;
     buf_init(&out);
     generate_v3_json(&out, &udata, settings_raw);
@@ -1318,7 +1407,7 @@ int main(int argc, char *argv[]) {
         pause_exit(1);
     }
 
-    printf("\n转换成功：v2 → v3\n");
+    printf("\n转换成功\n");
     printf("输出文件：%s\n", output_path);
     printf("文件大小：%.1f KB\n", (double)out.len / 1024.0);
 
