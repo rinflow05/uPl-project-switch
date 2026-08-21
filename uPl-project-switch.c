@@ -327,8 +327,13 @@ typedef struct {
     Tempo *tempos;
     int tempo_total;
     int tracks;
-    TrackInfo *tracks_info;
+    TrackInfo *tracks_info;      /* 人声轨（仅有音符） */
     int tracks_info_count;
+    TrackInfo *empty_tracks;     /* 空人声轨（无音符，且非音频轨） */
+    int empty_tracks_count;
+    TrackInfo *all_tracks;       /* 全部轨道（含空轨/音频轨） */
+    int all_tracks_count;
+    char *wave_flag;             /* 长度 = tracks，1 表示被 wave_parts 引用（音频轨） */
     int wave_part_count;
     Note *notes;
     int note_count;
@@ -547,7 +552,8 @@ static void parse_ustx(const char *yaml, UstxData *d) {
         free(names);
     } else d->tracks = 1;
 
-    /* 4. wave_parts count */
+    /* 4. wave_parts count + wave track flags（音频轨） */
+    if (d->tracks > 0) d->wave_flag = (char*)calloc(d->tracks, 1);
     li = find_root_key(lines, total_lines, "wave_parts");
     if (li >= 0) {
         char k[128]; const char *v; int vl;
@@ -557,10 +563,32 @@ static void parse_ustx(const char *yaml, UstxData *d) {
             else {
                 int next_root = find_next_root(lines, total_lines, li);
                 int count = 0;
+                int cur_track = -1;
                 for (int i = li + 1; i < next_root; i++) {
                     if (is_blank_or_comment(lines[i])) continue;
                     int ind = indent_level(lines[i]);
-                    if (ind == 0 && lines[i][ind] == '-') count++;
+                    if (ind == 0 && lines[i][ind] == '-') {
+                        /* 新 wave_part 开始 */
+                        count++;
+                        cur_track = -1;
+                        /* 同行可能有 track_no */
+                        char ck[128]; const char *cv; int cvl;
+                        if (parse_yaml_kv(lines[i], ck, sizeof(ck), &cv, &cvl)) {
+                            if (strcmp(ck, "track_no") == 0) cur_track = atoi(cv);
+                        }
+                        if (cur_track >= 0 && d->wave_flag && cur_track < d->tracks)
+                            d->wave_flag[cur_track] = 1;
+                    } else if (ind == 2) {
+                        /* wave_part 级字段 */
+                        char ck[128]; const char *cv; int cvl;
+                        if (parse_yaml_kv(lines[i], ck, sizeof(ck), &cv, &cvl)) {
+                            if (strcmp(ck, "track_no") == 0) {
+                                cur_track = atoi(cv);
+                                if (cur_track >= 0 && d->wave_flag && cur_track < d->tracks)
+                                    d->wave_flag[cur_track] = 1;
+                            }
+                        }
+                    }
                 }
                 d->wave_part_count = count;
             }
@@ -784,6 +812,13 @@ static void parse_ustx(const char *yaml, UstxData *d) {
         }
     }
 
+    /* 保存全部轨道（含空轨/音频轨），供 empty_tracks 使用 */
+    if (d->tracks > 0) {
+        d->all_tracks = (TrackInfo*)calloc(d->tracks, sizeof(TrackInfo));
+        d->all_tracks_count = d->tracks;
+        for (int t = 0; t < d->tracks; t++) d->all_tracks[t] = d->tracks_info[t];
+    }
+
     /* 构建 tracks_info（只含有音符的轨道） */
     int vocal_count = 0;
     for (int t = 0; t < d->tracks; t++) {
@@ -804,87 +839,259 @@ static void parse_ustx(const char *yaml, UstxData *d) {
         d->tracks_info_count = 0;
     }
 
+    /* 构建 empty_tracks（无音符，且非音频轨） */
+    int empty_count = 0;
+    if (d->all_tracks_count > 0) {
+        for (int t = 0; t < d->all_tracks_count; t++) {
+            if (d->all_tracks[t].note_count == 0 &&
+                !(d->wave_flag && d->wave_flag[d->all_tracks[t].track_no])) empty_count++;
+        }
+        if (empty_count > 0) {
+            d->empty_tracks = (TrackInfo*)calloc(empty_count, sizeof(TrackInfo));
+            int idx = 0;
+            for (int t = 0; t < d->all_tracks_count; t++) {
+                if (d->all_tracks[t].note_count == 0 &&
+                    !(d->wave_flag && d->wave_flag[d->all_tracks[t].track_no])) {
+                    d->empty_tracks[idx++] = d->all_tracks[t];
+                }
+            }
+            d->empty_tracks_count = empty_count;
+        }
+    }
+
     /* 释放行内存 */
     for (int i = 0; i < total_lines; i++) free(lines[i]);
     free(lines);
 }
 
-/* ===================== settings v3 修复 ===================== */
+/* ===================== settings v3 重写 ===================== */
 
-/* 修复 settings 以符合 v3 规范：
- *   1. 删除 "ustx_path" 字段（v3 不持久化路径，改为会话级变量）
- *   2. 添加 "selected_track_no": 0（v3 多轨工程默认轨，缺失时导入端会回退第一条）
- * 返回新分配的字符串，调用方负责释放。 */
-static char *fixup_settings_v3(const char *settings_json) {
-    if (!settings_json || !*settings_json) {
-        char *out = (char*)malloc(32);
-        snprintf(out, 32, "{\"selected_track_no\": 0}");
-        return out;
+/* 跳过 p 处的一个 JSON 值，返回其后已闭合的指针（p 指向值起点：'"'/'{ ' '['/标量） */
+static const char *json_skip_value(const char *p) {
+    if (*p == '"') {
+        p++;
+        while (*p) {
+            if (*p == '\\' && p[1]) p += 2;
+            else if (*p == '"') { p++; break; }
+            else p++;
+        }
+        return p;
+    }
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = (open == '{') ? '}' : ']';
+        int depth = 0; const char *q = p;
+        while (*q) {
+            if (*q == '"') {
+                q++;
+                while (*q) {
+                    if (*q == '\\' && q[1]) q += 2;
+                    else if (*q == '"') { q++; break; }
+                    else q++;
+                }
+            } else {
+                if (*q == open) depth++;
+                else if (*q == close) {
+                    depth--; q++;
+                    if (depth == 0) return q;
+                    continue;
+                }
+            }
+            q++;
+        }
+        return q;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']') p++;
+    return p;
+}
+
+/* 读取对象键（p 指向开引号），拷贝到 key，返回收尾引号后指针 */
+static const char *json_read_key(const char *p, char *key, int ksize) {
+    p++; int j = 0;
+    while (*p) {
+        if (*p == '\\' && p[1]) { if (j < ksize - 1) key[j++] = p[1]; p += 2; }
+        else if (*p == '"') { p++; break; }
+        else { if (j < ksize - 1) key[j++] = *p; p++; }
+    }
+    key[j] = '\0';
+    return p;
+}
+
+/* 对象条目：key + 原始值区间，type: 0=标量 1=字符串 2=对象 3=数组 */
+typedef struct {
+    char key[128];
+    const char *vstart, *vend;
+    int type;
+} SEntry;
+
+/* 解析 `{...}` 对象的所有顶级条目到数组；返回条目数（obj 指向 '{'） */
+static int split_object_entries(const char *obj, SEntry **out) {
+    SEntry *e = NULL; int n = 0, cap = 0;
+    const char *p = obj;
+    if (*p == '{') p++;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '}') break;
+        if (*p != '"') { break; }
+        if (n >= cap) { cap = cap ? cap * 2 : 16; e = (SEntry*)realloc(e, cap * sizeof(SEntry)); }
+        p = json_read_key(p, e[n].key, sizeof(e[n].key));
+        while (*p && *p != ':') p++;
+        if (*p == ':') p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        e[n].vstart = p;
+        if (*p == '"') e[n].type = 1;
+        else if (*p == '{') e[n].type = 2;
+        else if (*p == '[') e[n].type = 3;
+        else e[n].type = 0;
+        p = json_skip_value(p);
+        e[n].vend = p;
+        n++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') break;
+    }
+    *out = e;
+    return n;
+}
+
+/* 解析 style 对象（vstart..vend），紧凑重输出为一行 {"a": "b", "c": "d"} */
+static void buf_emit_style_compact(Buf *out, SEntry *style_obj, int style_n) {
+    buf_char(out, '{');
+    for (int i = 0; i < style_n; i++) {
+        if (i > 0) buf_str(out, ", ");
+        buf_char(out, '"');
+        buf_str(out, style_obj[i].key);
+        buf_str(out, "\": ");
+        buf_append(out, style_obj[i].vstart, (size_t)(style_obj[i].vend - style_obj[i].vstart));
+    }
+    buf_char(out, '}');
+}
+
+/* 重新生成 v3 settings 对象（含 CRLF），写入 out。
+ * raw 是 v2 的 settings JSON（含 { }）。d 提供轨道信息以重映射 note_styles。 */
+static void emit_settings(Buf *out, const char *raw, UstxData *d) {
+    if (!raw || !*raw) {
+        /* 空设置：仅补 selected_track_no */
+        buf_str(out, "{\r\n    \"selected_track_no\": 0\r\n  }");
+        return;
+    }
+    SEntry *entries = NULL;
+    int n = split_object_entries(raw, &entries);
+
+    /* 原文 note_styles（键=全局行号, 值=样式） */
+    int orig_style[8192];
+    for (int i = 0; i < 8192; i++) orig_style[i] = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(entries[i].key, "note_styles") == 0 && entries[i].type == 2) {
+            SEntry *ns = NULL;
+            int nn = split_object_entries(entries[i].vstart, &ns);
+            for (int j = 0; j < nn; j++) {
+                int k = atoi(ns[j].key);
+                char v[32]; int vl = (int)(ns[j].vend - ns[j].vstart);
+                if (vl >= 31) vl = 31;
+                memcpy(v, ns[j].vstart, vl); v[vl] = '\0';
+                if (k >= 0 && k < 8192) orig_style[k] = atoi(v);
+            }
+            free(ns);
+            break;
+        }
     }
 
-    Buf b; buf_init(&b);
-    buf_str(&b, settings_json);
-
-    /* 1. 删除 "ustx_path": "..." 键值对（含转义字符串值） */
-    {
-        const char *key = "\"ustx_path\"";
-        char *pos = strstr(b.p, key);
-        if (pos) {
-            char *start = pos;
-            pos += strlen(key);
-            while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r') pos++;
-            if (*pos == ':') {
-                pos++;
-                while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r') pos++;
-                if (*pos == '"') {
-                    pos++;
-                    while (*pos) {
-                        if (*pos == '\\' && pos[1]) pos += 2;
-                        else if (*pos == '"') { pos++; break; }
-                        else pos++;
-                    }
-                }
-                /* 跳过尾随空白和可选逗号 */
-                while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r') pos++;
-                if (*pos == ',') pos++;
-                while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r') pos++;
-                memmove(start, pos, strlen(pos) + 1);
-                b.len = strlen(b.p);
+    /* 选中轨（转换按 v3 默认第 0 轨处理）；收集该轨音符的全局行号 */
+    int sel = 0;
+    int sel_rows[8192]; int sel_n = 0;
+    for (int i = 0; i < d->note_count; i++) {
+        if (d->notes[i].track_no == sel) sel_rows[sel_n++] = i;
+    }
+    /* selected_track_no 非 0 时：构建过滤与 note_styles 均按选中轨 */
+    for (int i = 0; i < n; i++) {
+        if (strcmp(entries[i].key, "selected_track_no") == 0) {
+            /* 若显式存在则读取 */
+            char v[32]; int vl = (int)(entries[i].vend - entries[i].vstart);
+            if (vl >= 31) vl = 31;
+            memcpy(v, entries[i].vstart, vl); v[vl] = '\0';
+            int st = atoi(v);
+            if (st != sel) {
+                sel = st;
+                sel_n = 0;
+                for (int g = 0; g < d->note_count; g++)
+                    if (d->notes[g].track_no == sel) sel_rows[sel_n++] = g;
             }
         }
     }
 
-    /* 2. 添加 "selected_track_no": 0（已存在则跳过） */
-    if (!strstr(b.p, "\"selected_track_no\"")) {
-        char *last_brace = strrchr(b.p, '}');
-        if (last_brace) {
-            size_t offset = (size_t)(last_brace - b.p);
-            /* 判断 } 前是否有非空白内容，决定是否加逗号 */
-            char *prev = last_brace - 1;
-            while (prev >= b.p && (*prev == ' ' || *prev == '\t' || *prev == '\n' || *prev == '\r')) prev--;
-            int need_comma = (prev >= b.p && *prev != '{');
-            const char *insert = need_comma ? ", \"selected_track_no\": 0" : "\"selected_track_no\": 0";
-            size_t insert_len = strlen(insert);
-            buf_grow(&b, insert_len);
-            /* realloc 可能移动内存，重新定位 */
-            char *lb = b.p + offset;
-            memmove(lb + insert_len, lb, strlen(lb) + 1);
-            memcpy(lb, insert, insert_len);
-            b.len = strlen(b.p);
+    buf_str(out, "{\r\n");
+    for (int i = 0; i < n; i++) {
+        SEntry *en = &entries[i];
+        if (strcmp(en->key, "ustx_path") == 0) continue;
+        if (strcmp(en->key, "note_styles") == 0) continue; /* 稍后重映射输出 */
+
+        buf_str(out, "    \"");
+        buf_str(out, en->key);
+        buf_str(out, "\": ");
+
+        if (strcmp(en->key, "styles") == 0 && en->type == 3) {
+            /* 解析 styles 数组内的每个对象并紧凑输出 */
+            const char *arr = en->vstart; /* '[' */
+            buf_str(out, "[\r\n");
+            const char *q = arr + 1;
+            for (;;) {
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == ',') q++;
+                if (*q == ']') break;
+                if (*q == '{') {
+                    SEntry *se = NULL;
+                    int sn = split_object_entries(q, &se);
+                    /* 定位该对象结束 */
+                    const char *after = json_skip_value(q);
+                    buf_str(out, "      ");
+                    buf_emit_style_compact(out, se, sn);
+                    q = after;
+                    /* 若后面还有元素则加逗号 */
+                    const char *r = q;
+                    while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+                    if (*r == ',') {
+                        buf_str(out, ",\r\n");
+                        q = r + 1;
+                    } else {
+                        buf_str(out, "\r\n");
+                        while (*q && *q != ']') q++;
+                    }
+                    free(se);
+                } else q++;
+            }
+            buf_str(out, "    ],\r\n");
         } else {
-            /* 没找到 }，追加闭合 */
-            buf_str(&b, "\"selected_track_no\": 0}");
+            /* 标量/字符串/其他数组：原样复制值 */
+            buf_append(out, en->vstart, (size_t)(en->vend - en->vstart));
+            buf_str(out, ",\r\n");
         }
     }
 
-    return b.p;
+    /* note_styles：原文取值，重映射到选中轨音符下标 */
+    if (sel_n > 0) {
+        buf_str(out, "    \"note_styles\": {\r\n");
+        for (int i = 0; i < sel_n; i++) {
+            int g = sel_rows[i];
+            char kb[16]; snprintf(kb, sizeof(kb), "%d", i);
+            buf_str(out, "      \"");
+            buf_str(out, kb);
+            buf_str(out, "\": ");
+            buf_int(out, orig_style[g]);
+            buf_str(out, i < sel_n - 1 ? ",\r\n" : "\r\n");
+        }
+        buf_str(out, "    },\r\n");
+    }
+
+    buf_str(out, "    \"selected_track_no\": 0\r\n");
+    buf_str(out, "  }");
+
+    free(entries);
 }
 
 /* ===================== v3 JSON 生成 ===================== */
 
 static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
     buf_str(out, "{\r\n");
-    buf_str(out, "  \"format\": \"ustxPlayer.uplr\",\r\n");
+    buf_str(out, "  \"format\": \"ustxPlayer.uprj\",\r\n");
     buf_str(out, "  \"version\": 3,\r\n");
     buf_str(out, "  \"ustx_data\": {\r\n");
     buf_str(out, "    \"version\": ");
@@ -897,35 +1104,51 @@ static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
     buf_int(out, d->tempo_count);
     buf_str(out, ",\r\n");
 
-    /* tempos */
-    buf_str(out, "    \"tempos\": [");
+    /* tempos（每元素一行） */
+    buf_str(out, "    \"tempos\": [\r\n");
     for (int i = 0; i < d->tempo_count; i++) {
-        if (i > 0) buf_str(out, ", ");
-        buf_str(out, "{\"position\": ");
+        buf_str(out, "      {\"position\": ");
         buf_int(out, d->tempos[i].position);
         buf_str(out, ", \"bpm\": ");
         buf_int(out, d->tempos[i].bpm);
         buf_str(out, "}");
+        buf_str(out, i < d->tempo_count - 1 ? ",\r\n" : "\r\n");
     }
-    buf_str(out, "],\r\n");
+    buf_str(out, "    ],\r\n");
 
     buf_str(out, "    \"tracks\": ");
     buf_int(out, d->tracks);
     buf_str(out, ",\r\n");
 
-    /* tracks_info */
-    buf_str(out, "    \"tracks_info\": [");
+    /* tracks_info（每元素一行） */
+    buf_str(out, "    \"tracks_info\": [\r\n");
     for (int i = 0; i < d->tracks_info_count; i++) {
-        if (i > 0) buf_str(out, ", ");
-        buf_str(out, "{\"track_no\": ");
+        buf_str(out, "      {\"track_no\": ");
         buf_int(out, d->tracks_info[i].track_no);
         buf_str(out, ", \"track_name\": ");
         buf_json_str(out, d->tracks_info[i].track_name);
         buf_str(out, ", \"note_count\": ");
         buf_int(out, d->tracks_info[i].note_count);
         buf_str(out, "}");
+        buf_str(out, i < d->tracks_info_count - 1 ? ",\r\n" : "\r\n");
     }
-    buf_str(out, "],\r\n");
+    buf_str(out, "    ],\r\n");
+
+    /* empty_tracks（默认 expand 格式，非紧凑） */
+    buf_str(out, "    \"empty_tracks\": [\r\n");
+    for (int i = 0; i < d->empty_tracks_count; i++) {
+        buf_str(out, "      {\r\n");
+        buf_str(out, "        \"track_no\": ");
+        buf_int(out, d->empty_tracks[i].track_no);
+        buf_str(out, ",\r\n");
+        buf_str(out, "        \"track_name\": ");
+        buf_json_str(out, d->empty_tracks[i].track_name);
+        buf_str(out, ",\r\n");
+        buf_str(out, "        \"note_count\": 0\r\n");
+        buf_str(out, "      }");
+        buf_str(out, i < d->empty_tracks_count - 1 ? ",\r\n" : "\r\n");
+    }
+    buf_str(out, "    ],\r\n");
 
     buf_str(out, "    \"wave_part_count\": ");
     buf_int(out, d->wave_part_count);
@@ -968,12 +1191,8 @@ static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
 
     /* settings */
     buf_str(out, "  \"settings\": ");
-    if (settings_json) {
-        buf_str(out, settings_json);
-    } else {
-        buf_str(out, "{}");
-    }
-    buf_str(out, "\r\n}\r\n");
+    emit_settings(out, settings_json, d);
+    buf_str(out, "\r\n}");
 }
 
 /* ===================== 输出路径生成 ===================== */
@@ -981,9 +1200,9 @@ static void generate_v3_json(Buf *out, UstxData *d, const char *settings_json) {
 static char *make_output_path(const char *input) {
     const char *dot = strrchr(input, '.');
     size_t base_len = dot ? (size_t)(dot - input) : strlen(input);
-    char *out = (char*)malloc(base_len + 8);
+    char *out = (char*)malloc(base_len + 9);
     memcpy(out, input, base_len);
-    memcpy(out + base_len, "_v3.uplr", 8);
+    memcpy(out + base_len, "_v3.uprj", 8);
     out[base_len + 8] = '\0';
     return out;
 }
@@ -1066,10 +1285,8 @@ int main(int argc, char *argv[]) {
         pause_exit(1);
     }
 
-    /* 提取 settings 并修复为 v3 规范（删除 ustx_path，添加 selected_track_no） */
+    /* 提取 settings（原始 v2 settings，交给 emit_settings 重写为 v3 规范） */
     char *settings_raw = extract_settings(json);
-    char *settings = fixup_settings_v3(settings_raw);
-    free(settings_raw);
 
     /* 解析 USTX YAML */
     printf("正在解析 USTX 内容...\n");
@@ -1087,7 +1304,7 @@ int main(int argc, char *argv[]) {
     /* 生成 v3 JSON */
     Buf out;
     buf_init(&out);
-    generate_v3_json(&out, &udata, settings);
+    generate_v3_json(&out, &udata, settings_raw);
 
     /* 写入输出文件 */
     char *output_path = make_output_path(input_path);
@@ -1097,7 +1314,7 @@ int main(int argc, char *argv[]) {
         free(out.p);
         free(json);
         free(ustx_content);
-        free(settings);
+        free(settings_raw);
         pause_exit(1);
     }
 
@@ -1110,7 +1327,7 @@ int main(int argc, char *argv[]) {
     free(out.p);
     free(json);
     free(ustx_content);
-    free(settings);
+    free(settings_raw);
     for (int i = 0; i < udata.note_count; i++) {
         free(udata.notes[i].pitch_bend);
         free(udata.notes[i].pitch_ticks);
@@ -1118,6 +1335,9 @@ int main(int argc, char *argv[]) {
     free(udata.notes);
     free(udata.tempos);
     free(udata.tracks_info);
+    free(udata.all_tracks);
+    free(udata.empty_tracks);
+    free(udata.wave_flag);
 
     pause_exit(0);
     return 0;
